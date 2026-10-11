@@ -1,0 +1,49 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-build.txt
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
+      - name: Package application
+        run: python -m PyInstaller --noconfirm --clean pack-vault.spec
+      - name: Archive Linux app
+        if: runner.os == 'Linux'
+        run: tar -czf dist/PackVault-Linux.tar.gz -C dist PackVault
+      - name: Archive Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/PackVault -DestinationPath dist/PackVault-Windows.zip
+      - name: Archive macOS app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/PackVault.app dist/PackVault-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PackVault-${{ runner.os }}
+          path: |
+            dist/PackVault-Linux.tar.gz
+            dist/PackVault-Windows.zip
+            dist/PackVault-macOS.zip
+          if-no-files-found: error
