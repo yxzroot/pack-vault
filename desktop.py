@@ -18,15 +18,18 @@ from PySide6.QtCore import (Property, QEasingCurve, QParallelAnimationGroup, QPa
 from PySide6.QtGui import (QBrush, QColor, QDesktopServices, QIcon, QLinearGradient, QPainter,
                            QPainterPath, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QInputDialog, QLineEdit,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QInputDialog, QLineEdit, QListWidget, QListWidgetItem,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QMainWindow, QMessageBox, QPushButton, QScrollArea,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
 from app import (DEFAULT_LIBRARY, DEFAULT_PACKS, app_directories, asset_path, discover_clients,
                   import_pack, install_from_library, list_packs, pack_data, toggle)
-from features import (apply_profile, enabled_zip_names, latest_modrinth_version, modrinth_slug,
-                      scan_conflicts)
+from features import (apply_profile, download_modrinth_pack, enabled_zip_names,
+                      latest_modrinth_version, modrinth_slug, scan_conflicts)
+from compatibility import FORMATS, convert_pack, detect_game_version, pack_format, pack_supports, texture_previews
+from game_options import read_order, write_order
 
 
 SETTINGS = app_directories()[1] / "settings.json"
@@ -350,9 +353,11 @@ class WelcomeTour(QDialog):
 class UpdateWorker(QThread):
     checked = Signal(object)
 
-    def __init__(self, projects, parent=None):
+    def __init__(self, projects, library, game_version, parent=None):
         super().__init__(parent)
         self.projects = projects
+        self.library = library
+        self.game_version = game_version
 
     def run(self):
         versions, errors = {}, {}
@@ -360,11 +365,33 @@ class UpdateWorker(QThread):
             if self.isInterruptionRequested():
                 break
             try:
-                versions[name] = latest_modrinth_version(slug)
+                versions[name] = latest_modrinth_version(
+                    slug, installed_file=self.library / name, game_version=self.game_version)
             except (ValueError, OSError, URLError, KeyError, TypeError) as exc:
                 errors[name] = str(exc)
         if not self.isInterruptionRequested():
             self.checked.emit((versions, errors))
+
+
+class DownloadWorker(QThread):
+    downloaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, file, version, library, parent=None):
+        super().__init__(parent)
+        self.file = file
+        self.version = version
+        self.library = library
+
+    def run(self):
+        try:
+            path = download_modrinth_pack(self.file, self.library, self.version,
+                                          cancelled=self.isInterruptionRequested)
+            if not self.isInterruptionRequested():
+                self.downloaded.emit(path)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            if not self.isInterruptionRequested():
+                self.failed.emit(str(exc))
 
 
 class PackVault(QMainWindow):
@@ -389,7 +416,11 @@ class PackVault(QMainWindow):
         self._toast = None
         self.toast_animation = None
         self.update_worker = None
+        self.download_worker = None
+        self.download_context = None
         self.update_mode = None
+        self._waiting_to_close = False
+        self.options_confirmed = False
         self.setAcceptDrops(True)
         self.setWindowTitle("Pack Vault · Minecraft resource packs")
         self.setWindowIcon(QIcon(str(asset_path("icon.svg"))))
@@ -459,6 +490,13 @@ class PackVault(QMainWindow):
 
         tools = QHBoxLayout()
         tools.addWidget(QLabel("Drop ZIPs here to import  ·"))
+        tools.addWidget(QLabel("MC version"))
+        self.version_box = QComboBox()
+        self.version_box.addItem("Choose version", "")
+        for version in FORMATS:
+            self.version_box.addItem(version, version)
+        self.version_box.currentIndexChanged.connect(self.change_version)
+        tools.addWidget(self.version_box)
         check_conflicts = AnimatedButton("Scan overlaps")
         check_conflicts.clicked.connect(self.show_conflicts)
         tools.addWidget(check_conflicts)
@@ -556,6 +594,34 @@ class PackVault(QMainWindow):
         self.profile_cards.setSpacing(12)
         profile_scroll.setWidget(profile_container)
         self.tabs.addTab(profile_scroll, "Profiles")
+        order_page = QWidget()
+        order_layout = QVBoxLayout(order_page)
+        order_title = QLabel("Pack order  ·  drag to rearrange")
+        order_title.setObjectName("hello")
+        order_layout.addWidget(order_title)
+        order_hint = QLabel("Top = highest priority. Tick the packs you want Minecraft to select, then Save. Close Minecraft first; Pack Vault backs up options.txt before writing.")
+        order_hint.setObjectName("sub")
+        order_hint.setWordWrap(True)
+        order_layout.addWidget(order_hint)
+        self.order_list = QListWidget()
+        self.order_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.order_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        order_layout.addWidget(self.order_list, 1)
+        self.order_state = QLabel()
+        self.order_state.setObjectName("hint")
+        self.order_state.setWordWrap(True)
+        order_layout.addWidget(self.order_state)
+        order_buttons = QHBoxLayout()
+        refresh_order = AnimatedButton("↻  Reload")
+        refresh_order.clicked.connect(self.render_order)
+        order_buttons.addWidget(refresh_order)
+        save_order = AnimatedButton("Save order to Minecraft")
+        save_order.setObjectName("primary")
+        save_order.clicked.connect(self.save_order)
+        order_buttons.addWidget(save_order)
+        order_buttons.addStretch()
+        order_layout.addLayout(order_buttons)
+        self.tabs.addTab(order_page, "Pack order")
         layout.addWidget(self.tabs, 1)
         bottom = QHBoxLayout()
         hint = QLabel("Imported packs are stored safely in your library. Existing packs are never replaced.")
@@ -630,10 +696,26 @@ class PackVault(QMainWindow):
         if not path:
             return
         self.folder = Path(path)
+        self.options_confirmed = False
         self.folder_label.setText(f"Resourcepacks → {self.folder}")
+        detected = detect_game_version(self.folder)
+        selected = self.settings.get("client_versions", {}).get(path) or detected or ""
+        self.version_box.blockSignals(True)
+        index = self.version_box.findData(selected)
+        self.version_box.setCurrentIndex(max(index, 0))
+        self.version_box.blockSignals(False)
         self.settings["client"] = path
         self.save_settings()
         self.reload()
+
+    def change_version(self):
+        version = self.version_box.currentData() or ""
+        self.settings.setdefault("client_versions", {})[str(self.folder)] = version
+        self.save_settings()
+        self.render()
+
+    def selected_version(self):
+        return self.version_box.currentData() or None
 
     def add_client(self):
         chosen = QFileDialog.getExistingDirectory(self, "Choose a client's resourcepacks folder", str(Path.home()))
@@ -816,6 +898,9 @@ class PackVault(QMainWindow):
         if tab == 3:
             self.render_profiles()
             return
+        if tab == 4:
+            self.render_order()
+            return
         for animation in self.card_animations:
             animation.stop()
         self.card_animations.clear()
@@ -870,7 +955,8 @@ class PackVault(QMainWindow):
         row.addStretch()
         layout.addLayout(row)
         self.profile_cards.addWidget(header)
-        for name, packs in sorted(saved.items()):
+        for name, entry in sorted(saved.items()):
+            packs = entry.get("packs", []) if isinstance(entry, dict) else entry
             card = QFrame()
             card.setObjectName("card")
             line = QHBoxLayout(card)
@@ -893,6 +979,48 @@ class PackVault(QMainWindow):
             line.addWidget(remove)
             self.profile_cards.addWidget(card)
 
+    def render_order(self):
+        self.order_list.clear()
+        available = [p["name"] for p in self.packs if p["enabled"]]
+        try:
+            selected = read_order(self.folder)
+            self.order_state.setText("Minecraft's current selection loaded. Drag a pack to change priority.")
+        except (OSError, ValueError, UnicodeError) as exc:
+            selected = []
+            self.order_state.setText(str(exc))
+        top_first = [name for name in reversed(selected) if name in available]
+        top_first += [name for name in available if name not in top_first]
+        for name in top_first:
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
+            item.setCheckState(Qt.CheckState.Checked if name in selected else Qt.CheckState.Unchecked)
+            self.order_list.addItem(item)
+
+    def confirm_options_write(self):
+        if self.options_confirmed:
+            return True
+        answer = QMessageBox.question(self, "Close Minecraft first",
+            "Changing selected packs while Minecraft is open can be overwritten by the game. "
+            "Have you closed this client? Pack Vault will back up options.txt before writing.")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.options_confirmed = True
+            return True
+        return False
+
+    def save_order(self):
+        try:
+            read_order(self.folder)
+            if not self.confirm_options_write():
+                return
+            top_first = [self.order_list.item(i).data(Qt.ItemDataRole.UserRole)
+                         for i in range(self.order_list.count())
+                         if self.order_list.item(i).checkState() == Qt.CheckState.Checked]
+            backup = write_order(self.folder, list(reversed(top_first)))
+            self.notify("Pack order saved" + (f" · backup: {backup.name}" if backup else " · no changes"))
+        except (OSError, ValueError, UnicodeError) as exc:
+            self.error(exc)
+
     def save_profile(self):
         name, ok = QInputDialog.getText(self, "Save profile", "Profile name (e.g. PvP or Skyblock):")
         name = name.strip()
@@ -904,25 +1032,49 @@ class PackVault(QMainWindow):
         if name in profiles and QMessageBox.question(self, "Replace profile?",
                 f"Replace your saved '{name}' profile with the current available ZIPs?") != QMessageBox.StandardButton.Yes:
             return
-        profiles[name] = enabled_zip_names(self.folder)
+        try:
+            order = read_order(self.folder)
+        except (OSError, ValueError, UnicodeError):
+            order = None
+        available = enabled_zip_names(self.folder)
+        if order is not None:
+            # Keep selected folder packs, but never save an unavailable ZIP into a loadout.
+            order = [item for item in order if item in available or (self.folder / item).is_dir()]
+        profiles[name] = {"packs": available, "order": order}
         self.save_settings()
         self.render_profiles()
         self.notify(f"Saved profile {name}")
 
     def activate_profile(self, name):
         path = str(self.folder)
-        wanted = self.settings.get("profiles", {}).get(path, {}).get(name)
-        if wanted is None:
+        entry = self.settings.get("profiles", {}).get(path, {}).get(name)
+        if entry is None:
             return self.error("Profile not found")
+        wanted = entry.get("packs", []) if isinstance(entry, dict) else entry
+        order = entry.get("order") if isinstance(entry, dict) else None
         current = self.settings.get("active_profiles", {}).get(path)
         previous = self.settings.get("profile_previous", {}).get(path)
         before = enabled_zip_names(self.folder)
         try:
+            old_order = read_order(self.folder) if order is not None else None
+        except (OSError, ValueError, UnicodeError) as exc:
+            return self.error(exc)
+        if order is not None and not self.confirm_options_write():
+            return
+        try:
             apply_profile(self.folder, wanted, DEFAULT_LIBRARY)
+            if order is not None:
+                write_order(self.folder, order, allow_hidden=True)
         except (ValueError, OSError) as exc:
+            try:
+                apply_profile(self.folder, before, DEFAULT_LIBRARY)
+            except (OSError, ValueError):
+                pass  # Report the original failure; existing options backups remain available.
             return self.error(exc)
         if not current or previous is None:
             self.settings.setdefault("profile_previous", {})[path] = before
+            if old_order is not None:
+                self.settings.setdefault("profile_previous_order", {})[path] = old_order
         self.settings.setdefault("active_profiles", {})[path] = name
         self.save_settings()
         self.reload()
@@ -933,12 +1085,23 @@ class PackVault(QMainWindow):
         previous = self.settings.get("profile_previous", {}).get(path)
         if previous is None:
             return self.error("No previous pack selection was saved")
+        old_order = self.settings.get("profile_previous_order", {}).get(path)
+        if old_order is not None and not self.confirm_options_write():
+            return
+        current = enabled_zip_names(self.folder)
         try:
             apply_profile(self.folder, previous, DEFAULT_LIBRARY)
+            if old_order is not None:
+                write_order(self.folder, old_order, allow_hidden=True)
         except (OSError, ValueError) as exc:
+            try:
+                apply_profile(self.folder, current, DEFAULT_LIBRARY)
+            except (OSError, ValueError):
+                pass
             return self.error(exc)
         self.settings.get("active_profiles", {}).pop(path, None)
         self.settings.get("profile_previous", {}).pop(path, None)
+        self.settings.get("profile_previous_order", {}).pop(path, None)
         self.save_settings()
         self.reload()
         self.notify("Previous pack selection restored")
@@ -997,7 +1160,7 @@ class PackVault(QMainWindow):
         if self.update_worker is not None:
             return self.notify("An update check is already running")
         self.update_mode = (baseline, projects)
-        worker = UpdateWorker(projects, self)
+        worker = UpdateWorker(projects, DEFAULT_LIBRARY, self.selected_version(), self)
         self.update_worker = worker
         worker.checked.connect(self.handle_update_results)
         worker.finished.connect(worker.deleteLater)
@@ -1010,11 +1173,16 @@ class PackVault(QMainWindow):
         baseline, projects = self.update_mode
         if baseline:
             for name, version in versions.items():
+                installed_id = version.get("installed_id")
+                compatible = version.get("compatible") or {}
                 self.settings.setdefault("tracked_updates", {})[name] = {
-                    "slug": projects[name], "id": version["id"]}
+                    "slug": projects[name], "id": installed_id or version["id"],
+                    "compatible_id": installed_id or compatible.get("id")}
             if versions:
                 self.save_settings()
-                self.notify("Update tracking enabled — current version saved as baseline")
+                matched = next(iter(versions.values())).get("installed_id")
+                self.notify("Pack version identified by hash" if matched else
+                            "Tracking enabled · ZIP version unknown; latest release is baseline")
                 self.render()
         else:
             updated = [f"{name}: {version['number']}\n{version['url']}" for name, version in versions.items()
@@ -1023,13 +1191,105 @@ class PackVault(QMainWindow):
                 QMessageBox.information(self, "Updates available", "New Modrinth versions:\n\n" + "\n\n".join(updated))
             elif not errors:
                 self.notify("No new releases since tracking began")
+            compatible_updates = [(name, version["compatible"]) for name, version in versions.items()
+                if version.get("compatible") and version["compatible"]["id"] !=
+                self.settings.get("tracked_updates", {}).get(name, {}).get("compatible_id")]
+            if compatible_updates:
+                choices = [f"{name} → {info['number']}" for name, info in compatible_updates]
+                choice, ok = QInputDialog.getItem(self, "Compatible update found",
+                    f"New release for Minecraft {self.selected_version()}. Choose a pack to download (original kept):",
+                    choices, 0, False)
+                if ok:
+                    name, info = compatible_updates[choices.index(choice)]
+                    self.download_update(name, info)
         if errors:
             QMessageBox.warning(self, "Update check", "Could not check:\n" + "\n".join(f"{n}: {e}" for n, e in errors.items()))
 
+    def download_update(self, old_name, info):
+        if self.download_worker is not None:
+            return self.notify("A download is already running")
+        self.download_context = (old_name, info, self.folder)
+        worker = DownloadWorker(info["file"], info["number"], DEFAULT_LIBRARY, self)
+        self.download_worker = worker
+        worker.downloaded.connect(self.finish_download)
+        worker.failed.connect(self.error)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda: setattr(self, "download_worker", None))
+        worker.start()
+        self.notify("Downloading and verifying update…")
+
+    def finish_download(self, destination):
+        old_name, info, client_folder = self.download_context
+        self.reload()
+        if self.folder != client_folder:
+            return self.notify(f"Update saved in library: {destination.name}. Select the original client to install it.")
+        answer = QMessageBox.question(self, "Verified update saved",
+            f"Saved {destination.name} in your library with its SHA-512 hash verified. "
+            "Install it into this client? The original pack stays untouched for rollback.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return self.notify(f"Update saved in library: {destination.name}")
+        try:
+            install_from_library(destination.name, self.folder, DEFAULT_LIBRARY)
+            try:
+                order = read_order(self.folder)
+            except (OSError, ValueError, UnicodeError):
+                order = []
+            if old_name in order and not self.confirm_options_write():
+                self.reload()
+                return self.notify(f"Installed {destination.name}; selection unchanged. Select it in Pack order when ready.")
+            if old_name in order:
+                old = self.folder / old_name
+                backups = self.folder.parent / "pack-vault-backups"
+                backups.mkdir(exist_ok=True)
+                backup = backups / f"{old_name}.before-{info['id']}.zip"
+                if not backup.exists() and old.is_file():
+                    shutil.copy2(old, backup)
+                write_order(self.folder, [destination.name if name == old_name else name for name in order])
+            self.settings.setdefault("update_rollback", {})[destination.name] = old_name
+            self.settings.setdefault("tracked_updates", {})[destination.name] = {
+                "slug": self.settings.get("tracked_updates", {}).get(old_name, {}).get("slug"),
+                "id": info["id"], "compatible_id": info["id"]}
+            self.save_settings()
+            self.reload()
+            self.notify(f"Installed {destination.name}. Original kept for rollback.")
+        except (OSError, ValueError) as exc:
+            self.error(f"Update saved in library, but could not fully activate: {exc}")
+
+    def rollback_update(self, new_name):
+        old_name = self.settings.get("update_rollback", {}).get(new_name)
+        if not old_name:
+            return self.error("No previous pack recorded for this update")
+        try:
+            order = read_order(self.folder)
+            if new_name not in order:
+                return self.notify("Updated pack is not selected here. Select the original in Pack order.")
+            if not self.confirm_options_write():
+                return
+            if not (self.folder / old_name).is_file():
+                if (self.folder / (old_name + ".disabled")).is_file():
+                    toggle(self.folder, old_name + ".disabled")
+                elif (DEFAULT_LIBRARY / old_name).is_file():
+                    install_from_library(old_name, self.folder, DEFAULT_LIBRARY)
+                else:
+                    raise ValueError(f"Original pack not found: {old_name}")
+            write_order(self.folder, [old_name if name == new_name else name for name in order])
+            self.notify(f"Restored {old_name} as the selected pack. Updated ZIP kept.")
+            self.reload()
+        except (OSError, ValueError) as exc:
+            self.error(exc)
+
     def closeEvent(self, event):
-        if self.update_worker is not None and self.update_worker.isRunning():
-            self.update_worker.requestInterruption()
-            self.update_worker.wait(17000)
+        running = [worker for worker in (self.update_worker, self.download_worker)
+                   if worker is not None and worker.isRunning()]
+        if running:
+            for worker in running:
+                worker.requestInterruption()
+                if not self._waiting_to_close:
+                    worker.finished.connect(self.close)
+            self._waiting_to_close = True
+            event.ignore()  # Never destroy a QThread while a network request is in flight.
+            self.notify("Finishing the current network request before closing…")
+            return
         super().closeEvent(event)
 
     def card(self, pack, from_library):
@@ -1061,6 +1321,16 @@ class PackVault(QMainWindow):
                         "○  Hidden" if not from_library else "○  In your library")
         status.setObjectName("active" if pack["enabled"] else "inactive")
         info.addWidget(status)
+        source = (DEFAULT_LIBRARY if from_library else self.folder) / pack["name"]
+        number = pack_format(source)
+        expected = self.selected_version()
+        supports = pack_supports(source, expected)
+        compatibility = QLabel(
+            f"Format {number} · {'✓ supports ' + expected if supports else '⚠ different from ' + expected}"
+            if number is not None and expected is not None and supports is not None else
+            f"Format {number}" if number is not None else "Unknown pack format")
+        compatibility.setObjectName("active" if supports else "inactive")
+        info.addWidget(compatibility)
         description = QLabel(re.sub(r"§.", "", pack["description"]))
         description.setObjectName("description")
         description.setWordWrap(True)
@@ -1068,6 +1338,13 @@ class PackVault(QMainWindow):
         info.addWidget(description)
         row.addLayout(info, 1)
         actions = QVBoxLayout()
+        preview = AnimatedButton("Preview")
+        preview.clicked.connect(lambda checked=False, p=source: self.preview_pack(p))
+        actions.addWidget(preview)
+        if pack["kind"] == "zip" and self.selected_version():
+            convert = AnimatedButton(f"Convert → {self.selected_version()}")
+            convert.clicked.connect(lambda checked=False, p=source: self.convert_for_client(p))
+            actions.addWidget(convert)
         if from_library:
             if pack["kind"] == "zip" and not installed:
                 install = AnimatedButton("Install →")
@@ -1083,6 +1360,10 @@ class PackVault(QMainWindow):
                     stop = AnimatedButton("Stop tracking")
                     stop.clicked.connect(lambda checked=False, n=pack["name"]: self.stop_tracking(n))
                     actions.addWidget(stop)
+                if pack["name"] in self.settings.get("update_rollback", {}):
+                    rollback = AnimatedButton("Restore previous")
+                    rollback.clicked.connect(lambda checked=False, n=pack["name"]: self.rollback_update(n))
+                    actions.addWidget(rollback)
         elif pack["kind"] == "zip":
             action = AnimatedButton("Hide" if pack["enabled"] else "Show")
             action.clicked.connect(lambda checked=False, n=pack["name"]: self.toggle_pack(n))
@@ -1093,6 +1374,67 @@ class PackVault(QMainWindow):
             actions.addWidget(backup)
         row.addLayout(actions)
         return card
+
+    def preview_pack(self, source):
+        pictures = texture_previews(source)
+        if not pictures:
+            return self.notify("No previewable PNG textures found")
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Preview · {source.name}")
+        dialog.resize(565, 420)
+        layout = QVBoxLayout(dialog)
+        title = QLabel(f"{source.name} · sample textures")
+        title.setObjectName("hello")
+        layout.addWidget(title)
+        note = QLabel("Sample images from the ZIP, not a full in-game render.")
+        note.setObjectName("sub")
+        layout.addWidget(note)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        grid = QGridLayout(container)
+        for i, (filename, raw) in enumerate(pictures):
+            image = QPixmap()
+            if not image.loadFromData(raw, "PNG"):
+                continue
+            tile = QFrame()
+            tile.setObjectName("panel")
+            part = QVBoxLayout(tile)
+            thumbnail = QLabel()
+            thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumbnail.setPixmap(image.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio,
+                                              Qt.TransformationMode.FastTransformation))
+            part.addWidget(thumbnail)
+            label = QLabel(filename.rsplit("/", 1)[-1])
+            label.setObjectName("description")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            part.addWidget(label)
+            grid.addWidget(tile, i // 3, i % 3)
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+        dialog.exec()
+
+    def convert_for_client(self, source):
+        version = self.selected_version()
+        if not version:
+            return self.error("Choose your Minecraft version first")
+        answer = QMessageBox.question(self, "Best-effort conversion",
+            f"Create a NEW copy of {source.name} for Minecraft {version}? This changes pack.mcmeta and adds "
+            "legacy block/item texture aliases when relevant. It cannot convert every changed model, shader, "
+            "sound, or texture. The original will remain untouched.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            destination = convert_pack(source, version, DEFAULT_LIBRARY)
+            try:
+                install_from_library(destination.name, self.folder, DEFAULT_LIBRARY)
+            except (OSError, ValueError):
+                self.notify(f"Converted copy saved in library: {destination.name}")
+            else:
+                self.notify(f"Created and installed {destination.name} · test it in Minecraft")
+            self.reload()
+        except (OSError, ValueError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
+            self.error(exc)
 
     def error(self, message):
         QMessageBox.warning(self, "Pack Vault", str(message))
@@ -1216,7 +1558,7 @@ if __name__ == "__main__":
                 raise SystemExit(f"Missing bundled asset: {asset}")
         app = QApplication([sys.argv[0]])
         window = PackVault()
-        if window.tabs.count() != 4:
+        if window.tabs.count() != 5:
             raise SystemExit("GUI failed to initialize")
         window.close()
         raise SystemExit(0)

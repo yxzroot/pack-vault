@@ -100,7 +100,8 @@ def pack_data(path):
         if not isinstance(description, str):
             description = json.dumps(description, ensure_ascii=False)
         return description, icon if icon and len(icon) < 2 * 1024 * 1024 else None
-    except (OSError, ValueError, KeyError, zipfile.BadZipFile, UnicodeError):
+    except (OSError, ValueError, KeyError, RuntimeError, NotImplementedError,
+            zipfile.BadZipFile, UnicodeError):
         return "Could not read pack metadata", None
 
 

@@ -1,13 +1,15 @@
 """Profiles, pack overlap detection, and opt-in Modrinth update checks."""
 
 from collections import defaultdict
+import hashlib
 import json
+from pathlib import Path
 import re
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 import zipfile
 
-from app import pack_path, place_in_client, toggle
+from app import MAX_UPLOAD, pack_path, place_in_client, toggle, zip_member
 
 
 def enabled_zip_names(folder):
@@ -98,7 +100,7 @@ def modrinth_slug(value):
     return value
 
 
-def latest_modrinth_version(slug):
+def latest_modrinth_version(slug, installed_file=None, game_version=None):
     """Explicit, read-only request to Modrinth for a tracked resource pack."""
     slug = modrinth_slug(slug)
     headers = {"User-Agent": "PackVault/1.0 (https://github.com/yxzroot/pack-vault)"}
@@ -116,5 +118,87 @@ def latest_modrinth_version(slug):
     if not versions:
         raise ValueError(f"{slug} has no published versions")
     latest = max(versions, key=lambda item: item["date_published"])
+    installed_id = None
+    if installed_file and Path(installed_file).is_file():
+        digest = hashlib.sha512()
+        with Path(installed_file).open("rb") as source:
+            for chunk in iter(lambda: source.read(65536), b""):
+                digest.update(chunk)
+        checksum = digest.hexdigest()
+        for version in versions:
+            if any(file.get("hashes", {}).get("sha512") == checksum
+                   for file in version.get("files", [])):
+                installed_id = version["id"]
+                break
+    compatible = None
+    if game_version:
+        matches = [version for version in versions if game_version in version.get("game_versions", [])]
+        if matches:
+            compatible_release = max(matches, key=lambda item: item["date_published"])
+            files = [file for file in compatible_release.get("files", [])
+                     if file.get("filename", "").lower().endswith(".zip") and
+                     file.get("hashes", {}).get("sha512") and file.get("url", "").startswith("https://cdn.modrinth.com/")]
+            if files:
+                compatible = {"id": compatible_release["id"], "number": compatible_release["version_number"],
+                              "file": next((file for file in files if file.get("primary")), files[0])}
     return {"id": latest["id"], "number": latest["version_number"],
+            "installed_id": installed_id, "compatible": compatible,
             "url": f"https://modrinth.com/resourcepack/{slug}/versions"}
+
+
+def download_modrinth_pack(file, library, version, cancelled=lambda: False):
+    """Download a compatible pack into a NEW file, verify SHA-512 and ZIP metadata."""
+    url = file.get("url", "")
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or parsed.hostname != "cdn.modrinth.com"
+            or parsed.username is not None or parsed.password is not None):
+        raise ValueError("Update URL is not a Modrinth CDN URL")
+    expected = file.get("hashes", {}).get("sha512", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{128}", expected):
+        raise ValueError("Modrinth SHA-512 hash is missing")
+    filename = Path(file.get("filename", "")).name
+    if not filename.lower().endswith(".zip"):
+        raise ValueError("Update is not a ZIP pack")
+    candidate = pack_path(library, filename)
+    if candidate.exists() or candidate.is_symlink():
+        safe_version = re.sub(r"[^A-Za-z0-9_.-]", "-", str(version))[:50]
+        candidate = pack_path(library, f"{Path(filename).stem}-modrinth-{safe_version}.zip")
+    if candidate.exists() or candidate.is_symlink():
+        raise ValueError(f"Pack already in library: {candidate.name}")
+    library.mkdir(parents=True, exist_ok=True)
+    created = False
+    digest = hashlib.sha512()
+    try:
+        with urlopen(Request(url, headers={"User-Agent": "PackVault/1.0 (github.com/yxzroot/pack-vault)"}), timeout=15) as response:
+            redirected = urlsplit(response.geturl())
+            if (redirected.scheme != "https" or redirected.hostname != "cdn.modrinth.com"
+                    or redirected.username is not None or redirected.password is not None):
+                raise ValueError("Update redirected outside Modrinth CDN")
+            with candidate.open("xb") as output:
+                created = True
+                size = 0
+                while True:
+                    if cancelled():
+                        raise ValueError("Download cancelled")
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_UPLOAD:
+                        raise ValueError("Update exceeds 128 MB")
+                    digest.update(chunk)
+                    output.write(chunk)
+        if digest.hexdigest().lower() != expected.lower():
+            raise ValueError("Update checksum does not match Modrinth")
+        with zipfile.ZipFile(candidate) as archive:
+            raw = zip_member(archive, "pack.mcmeta")
+            if raw is None:
+                raise ValueError("Update has no pack.mcmeta")
+            metadata = json.loads(raw)
+            if not isinstance(metadata, dict) or not isinstance(metadata.get("pack"), dict):
+                raise ValueError("Update has invalid pack.mcmeta")
+    except Exception:
+        if created:
+            candidate.unlink(missing_ok=True)
+        raise
+    return candidate
