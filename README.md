@@ -2,6 +2,8 @@
 
 A colorful, animated desktop app for managing Minecraft resource packs across clients. Keep one library, install packs into multiple clients, and preview icons/descriptions. No account required; online update checks are opt-in.
 
+**Little shoutout:** Built with yxzroot and GPT-6 Sol (OpenAI) in OpenCode — from a tiny pack manager to a cross-platform app with animations and releases. 🤖✨
+
 ## Download and run
 
 Download the ZIP for your system from the [latest release](https://github.com/yxzroot/pack-vault/releases/latest) and extract it first. Development builds also appear under **Artifacts** in the [build workflow](https://github.com/yxzroot/pack-vault/actions/workflows/build.yml).
