@@ -190,7 +190,7 @@ def texture_previews(path, limit=5):
         return []
 
 
-def convert_pack(source, version, library):
+def convert_pack(source, version, library, report=None):
     """Create a new ZIP; retarget metadata and alias legacy block/item texture folders only."""
     if version not in FORMATS:
         raise ValueError("Choose a supported Minecraft release")
@@ -226,6 +226,7 @@ def convert_pack(source, version, library):
             metadata["pack"].pop("max_format", None)
         # Old Minecraft doesn't understand newer compatibility/overlay metadata.
         metadata["pack"].pop("supported_formats", None)
+        removed_overlays = "overlays" in metadata and (target_format < 18 or source_format != target_pair)
         if target_format < 18 or source_format != target_pair:
             metadata.pop("overlays", None)
 
@@ -243,6 +244,8 @@ def convert_pack(source, version, library):
                     seen = set(names)
                     total = 0
                     aliases = []
+                    collisions = 0
+                    unconverted = {"models": 0, "shaders": 0, "sounds": 0}
                     for member in archive.infolist():
                         total += member.file_size
                         if total > 512 * 1024 * 1024:
@@ -253,6 +256,12 @@ def convert_pack(source, version, library):
                         if member.is_dir():
                             result.writestr(copy(member), b"")
                             continue
+                        if "/models/" in member.filename and member.filename.endswith(".json"):
+                            unconverted["models"] += 1
+                        if "/shaders/" in member.filename:
+                            unconverted["shaders"] += 1
+                        if "/sounds/" in member.filename:
+                            unconverted["sounds"] += 1
                         # ZipFile mutates ZipInfo.header_offset while writing: never pass
                         # the source's ZipInfo object into the destination archive.
                         with archive.open(member) as src, result.open(copy(member), "w") as dst:
@@ -266,6 +275,8 @@ def convert_pack(source, version, library):
                             if alias not in seen:
                                 aliases.append((member.filename, alias))
                                 seen.add(alias)
+                            else:
+                                collisions += 1
                         old_item = old.replace("block", "item")
                         new_item = new.replace("block", "item")
                         if (((source_format[0] < 4 <= target_format) or (target_format < 4 <= source_format[0])) and
@@ -274,6 +285,8 @@ def convert_pack(source, version, library):
                             if alias not in seen:
                                 aliases.append((member.filename, alias))
                                 seen.add(alias)
+                            else:
+                                collisions += 1
                     for original, alias in aliases:
                         total += archive.getinfo(original).file_size
                         if total > 512 * 1024 * 1024:
@@ -284,4 +297,10 @@ def convert_pack(source, version, library):
             if created:
                 destination.unlink(missing_ok=True)
             raise
+    if report is not None:
+        report.update({"source_format": _format_label(source_format),
+                       "target_format": _format_label(target_pair),
+                       "aliases": [alias for _, alias in aliases],
+                       "alias_collisions": collisions, "removed_overlays": removed_overlays,
+                       "unchanged": unconverted})
     return destination

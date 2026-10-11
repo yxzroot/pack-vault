@@ -53,8 +53,13 @@ class CompatibilityTests(unittest.TestCase):
                 archive.writestr("assets/minecraft/textures/items/diamond_sword.png", b"item")
                 archive.writestr("assets/minecraft/models/item/sword.json", b'{}')
                 archive.writestr("assets/", b"")
-            dest = convert_pack(source, "1.14.4", base / "library")
+            report = {}
+            dest = convert_pack(source, "1.14.4", base / "library", report=report)
             self.assertEqual(pack_format(dest), 4)
+            self.assertEqual(report["source_format"], 1)
+            self.assertEqual(report["target_format"], 4)
+            self.assertEqual(len(report["aliases"]), 2)
+            self.assertEqual(report["unchanged"]["models"], 1)
             self.assertEqual(pack_format(source), 1)
             with zipfile.ZipFile(dest) as archive:
                 self.assertEqual(archive.read("assets/minecraft/textures/block/stone.png"), b"stone")

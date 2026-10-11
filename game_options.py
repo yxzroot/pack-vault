@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 
@@ -110,3 +111,52 @@ def write_order(folder, names, allow_hidden=False):
         if temporary:
             temporary.unlink(missing_ok=True)
     return backup
+
+
+def options_backups(folder):
+    directory = folder.parent / "pack-vault-backups"
+    if directory.is_symlink() or not directory.is_dir():
+        return []
+    return sorted((path for path in directory.iterdir()
+                   if re.fullmatch(r"options-\d{8}-\d{6}-\d{6}\.txt", path.name)
+                   and path.is_file() and not path.is_symlink()), reverse=True)
+
+
+def restore_options_backup(folder, backup):
+    """Restore an app-created snapshot; first save the current options for undo."""
+    backup = Path(backup)
+    if backup.is_symlink() or backup not in options_backups(folder):
+        raise ValueError("Choose a Pack Vault options backup from this client")
+    if backup.stat().st_size > 5 * 1024 * 1024:
+        raise ValueError("Backup is too large")
+    original_path = folder.parent / "options.txt"
+    if original_path.is_symlink() or not original_path.is_file():
+        raise ValueError("Minecraft options.txt is missing or is a symlink")
+    original = original_path.read_bytes()
+    saved = backup.read_bytes()
+    try:
+        text = saved.decode("utf-8")
+        fields = [line for line in text.splitlines() if line.startswith("resourcePacks:")]
+        entries = json.loads(fields[0].partition(":")[2]) if len(fields) == 1 else None
+        if not isinstance(entries, list) or not all(isinstance(entry, str) for entry in entries):
+            raise ValueError("Invalid resourcePacks in backup")
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("Backup does not contain valid Minecraft options") from exc
+    if original == saved:
+        return None
+    directory = backup.parent
+    undo = directory / f"options-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.txt"
+    shutil.copy2(original_path, undo)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=original_path.parent, prefix=".pack-vault-", delete=False) as output:
+            temporary = Path(output.name)
+            output.write(saved)
+        shutil.copymode(original_path, temporary)
+        if original_path.read_bytes() != original:
+            raise ValueError("Minecraft changed options.txt while restoring. Close the game and try again.")
+        os.replace(temporary, original_path)
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+    return undo
