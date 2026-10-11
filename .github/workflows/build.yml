@@ -34,6 +34,24 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Package application
         run: python -m PyInstaller --noconfirm --clean pack-vault.spec
+      - name: Smoke-test Linux app
+        if: runner.os == 'Linux'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: dist/PackVault/PackVault --self-check
+      - name: Smoke-test Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $app = Start-Process -FilePath .\dist\PackVault\PackVault.exe -ArgumentList '--self-check' -Wait -PassThru
+          if ($app.ExitCode -ne 0) { throw "PackVault exited with code $($app.ExitCode)" }
+      - name: Smoke-test macOS app
+        if: runner.os == 'macOS'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: dist/PackVault.app/Contents/MacOS/PackVault --self-check
       - name: Archive Linux app
         if: runner.os == 'Linux'
         run: tar -czf dist/PackVault-Linux.tar.gz -C dist PackVault

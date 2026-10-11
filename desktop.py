@@ -920,6 +920,16 @@ class PackVault(QMainWindow):
 
 
 if __name__ == "__main__":
+    if "--self-check" in sys.argv:
+        for asset in ("icon.svg", "chevron.svg"):
+            if not asset_path(asset).is_file():
+                raise SystemExit(f"Missing bundled asset: {asset}")
+        app = QApplication([sys.argv[0]])
+        window = PackVault()
+        if window.tabs.count() != 3:
+            raise SystemExit("GUI failed to initialize")
+        window.close()
+        raise SystemExit(0)
     app = QApplication(sys.argv)
     window = PackVault()
     window.show()
