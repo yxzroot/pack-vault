@@ -20,7 +20,7 @@ Builds are **unsigned**. Windows SmartScreen and macOS Gatekeeper may show a war
 2. Click **Import ZIP** or drop ZIP files into the window. Pack Vault keeps a copy in **My library** and makes the pack available in that client. Existing packs are never overwritten or moved.
 3. To use the pack elsewhere, switch clients and choose **My library → Install**. The client list refreshes while the app is open.
 
-Pack Vault looks for vanilla Minecraft, OneClient, Lunar, Badlion, Feather, Prism, Modrinth, and MultiMC. Some launcher installations may need **Add folder**. You can browse and search packs, preview sample textures, hide or show ZIPs, and back up client packs. The sidebar offers five themes: Midnight, Sakura, Forest, Daylight, and Apple. On Linux and macOS, installed packs are linked to the library ZIP; on Windows, Pack Vault falls back to a separate copy when symlinks require elevated privileges. Replacing a library file will **not** update an independent Windows copy.
+Pack Vault looks for vanilla Minecraft, OneClient, Lunar, Badlion, Feather, Prism, Modrinth, and MultiMC. Some launcher installations may need **Add folder**. You can browse and search packs, preview sample textures, hide or show ZIPs, and back up client packs. The sidebar offers eight themes: Midnight, Sakura, Forest, Daylight, Apple, Aurora, Ember, and Glacier. On Linux and macOS, installed packs are linked to the library ZIP; on Windows, Pack Vault falls back to a separate copy when symlinks require elevated privileges. Replacing a library file will **not** update an independent Windows copy.
 
 ## More you can do
 

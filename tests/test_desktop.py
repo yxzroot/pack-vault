@@ -45,6 +45,18 @@ class DesktopTests(unittest.TestCase):
                 self.assertIsNotNone(window._toast)
                 window.close()
 
+    def test_new_themes_are_available_and_render_complete_palettes(self):
+        expected = {
+            "Aurora": ("#101725", "#19243a", "#67e8c7"),
+            "Ember": ("#21130e", "#352019", "#ffad72"),
+            "Glacier": ("#071d2b", "#0c2d40", "#79d7ff"),
+        }
+        for theme, colors in expected.items():
+            self.assertIn(theme, THEMES)
+            style = desktop.stylesheet(theme)
+            for color in colors:
+                self.assertIn(color, style)
+
     def test_responsive_sidebar_and_keyboard_navigation(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)

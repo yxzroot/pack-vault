@@ -46,6 +46,9 @@ THEMES = {
     "Forest": ("#101c19", "#1c2d28", "#385a4e", "#9ce0b0", "#edf9f1", "#9dbbaa"),
     "Daylight": ("#f2eff9", "#ffffff", "#d7cce8", "#7752ad", "#271e33", "#71667e"),
     "Apple": ("#f5f5f7", "#ffffff", "#d2d2d7", "#007aff", "#1d1d1f", "#6e6e73"),
+    "Aurora": ("#101725", "#19243a", "#354a67", "#67e8c7", "#f1f7ff", "#aabbd3"),
+    "Ember": ("#21130e", "#352019", "#6c4030", "#ffad72", "#fff4ee", "#e2b8a7"),
+    "Glacier": ("#071d2b", "#0c2d40", "#225d78", "#79d7ff", "#ecfaff", "#9cc9d9"),
 }
 
 
